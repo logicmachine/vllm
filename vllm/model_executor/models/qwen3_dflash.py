@@ -23,10 +23,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -237,12 +234,9 @@ class DFlashQwen3Model(nn.Module):
 
         current_vllm_config = get_current_vllm_config()
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
-        )
-
+        # embed_tokens is not allocated here to avoid wasting GPU memory.
+        # DFlash checkpoints never include embed_tokens; the target model's
+        # embed_tokens is shared via _maybe_share_embeddings() after loading.
         self.layers = nn.ModuleList(
             [
                 DFlashQwen3DecoderLayer(
@@ -610,11 +604,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
-        skip_substrs = []
+        # DFlash checkpoints never include embed_tokens by design;
+        # the target model's embed_tokens is always shared via _maybe_share_embeddings.
+        skip_substrs = ["embed_tokens"]
+        if includes_embed_tokens:
+            logger.warning(
+                "DFlash checkpoint unexpectedly contains embed_tokens weights. "
+                "They will be ignored; the target model's embed_tokens will be "
+                "shared instead."
+            )
         if not includes_draft_id_mapping:
             skip_substrs.append("draft_id_to_target_id")
-        if not includes_embed_tokens:
-            skip_substrs.append("embed_tokens")
         if not self.model.use_aux_hidden_state:
             skip_substrs.append("fc.")
         loader = AutoWeightsLoader(
