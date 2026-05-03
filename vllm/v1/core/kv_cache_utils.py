@@ -1039,6 +1039,11 @@ def unify_kv_cache_spec_page_size(
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
             new_spec = replace(layer_spec, block_size=new_block_size)
+            if new_spec.page_size_bytes != max_page_size:
+                # Some spec types (e.g., MambaSpec) have page_size_bytes
+                # independent of block_size. Use page_size_padded to satisfy
+                # the required page size without altering the block_size.
+                new_spec = replace(layer_spec, page_size_padded=max_page_size)
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
