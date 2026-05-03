@@ -128,7 +128,7 @@ class DFlashQwen3Attention(nn.Module):
         with the context K/V from the target model's hidden states. This forward op
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
-        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
+        qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Per-head RMSNorm
@@ -243,6 +243,7 @@ class DFlashQwen3Model(nn.Module):
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
+                    quant_config=self.quant_config,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -279,27 +280,43 @@ class DFlashQwen3Model(nn.Module):
         return self.embed_tokens(input_ids)
 
     def _build_fused_kv_buffers(self) -> None:
-        """Build fused weight buffers for precompute_and_store_context_kv.
+        """Build buffers for precompute_and_store_context_kv.
 
-        Must be called after weights are loaded. Stacks the KV-projection
-        weights, K-norm weights, and RoPE parameters from every attention
-        layer so that precompute_and_store_context_kv can run one fused
-        GEMM for all layers at once. Also aliases the weight of the hidden_norm.
+        Must be called after weights are loaded. Under unquantized weights,
+        stacks the KV-projection weights from all attention layers to run one
+        fused GEMM. Under quantization (e.g. ParoQuant / AWQ-Marlin), the
+        packed weight tensors cannot be row-sliced, so the fused path is
+        skipped and precompute_and_store_context_kv falls back to one
+        qkv_proj call per layer. All other buffers are built unconditionally.
         """
+        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
         has_bias = attn0.qkv_proj.bias is not None
 
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+        # Detect whether a dense row-sliceable .weight exists on qkv_proj.
+        self._fused_kv_path_enabled = all(
+            isinstance(a.qkv_proj.quant_method, UnquantizedLinearMethod)
+            for a in layers_attn
+        )
+
+        if self._fused_kv_path_enabled:
+            # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
+            kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+            if has_bias:
+                kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+                self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+            else:
+                self._fused_kv_bias = None
         else:
+            self._fused_kv_weight = None
             self._fused_kv_bias = None
+            self._qkv_projs = [a.qkv_proj for a in layers_attn]
+            self._q_sizes = [a.q_size for a in layers_attn]
 
         # K-norm weights: list of [head_dim] tensors, one per layer.
         self._k_norm_weights = [a.k_norm.weight.data for a in layers_attn]
@@ -364,7 +381,7 @@ class DFlashQwen3Model(nn.Module):
         hd = self._head_dim
         nkv = self._num_kv_heads
 
-        # --- Fused KV projection (one GEMM for all layers) ---
+        # --- KV projection (fused GEMM or per-layer fallback under quantization) ---
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
             normed_context_states,
@@ -372,17 +389,36 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
-        # Single contiguous copy that separates K/V and transposes to
-        # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
-        # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
-        all_kv = (
-            all_kv_flat.view(num_ctx, L, 2, nkv, hd).permute(2, 1, 0, 3, 4).contiguous()
-        )
-        all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
-        all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
+        if self._fused_kv_path_enabled:
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
+            # Single contiguous copy that separates K/V and transposes to
+            # layer-major layout. Result: [2, L, num_ctx, nkv, hd] contiguous.
+            all_kv = (
+                all_kv_flat.view(num_ctx, L, 2, nkv, hd)
+                .permute(2, 1, 0, 3, 4)
+                .contiguous()
+            )
+            all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
+            all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
+        else:
+            # Quantized fallback: one qkv_proj call per layer; bias is applied
+            # inside quant_method.apply so no explicit bias handling needed.
+            all_k = torch.empty(
+                (L, num_ctx, nkv, hd),
+                dtype=normed_context_states.dtype,
+                device=normed_context_states.device,
+            )
+            all_v = torch.empty_like(all_k)
+            for i in range(L):
+                qkv_proj = self._qkv_projs[i]
+                q_size = self._q_sizes[i]
+                qkv_out, _ = qkv_proj(normed_context_states)
+                k_flat = qkv_out[..., q_size : q_size + kv]
+                v_flat = qkv_out[..., q_size + kv : q_size + 2 * kv]
+                all_k[i] = k_flat.view(num_ctx, nkv, hd)
+                all_v[i] = v_flat.view(num_ctx, nkv, hd)
 
         # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
         all_k_normed = torch.empty_like(all_k)
