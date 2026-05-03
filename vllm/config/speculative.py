@@ -296,6 +296,12 @@ class SpeculativeConfig:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
 
+        # Draft model quantization changes the compiled graph (e.g. quantized
+        # Linear layers have different attributes than dense ones), so it must
+        # be part of the cache key to avoid stale-cache collisions.
+        if self.draft_model_config is not None:
+            factors.append(self.draft_model_config.quantization)
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
