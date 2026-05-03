@@ -244,6 +244,7 @@ class BatchDCPPrefillWrapper:
         kv_cache_dtype: torch.dtype,
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
+        causal: bool = True,
     ):
         """Plan the prefill operation with given parameters."""
         self._context.plan(
@@ -271,7 +272,7 @@ class BatchDCPPrefillWrapper:
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim,
             head_dim_vo=head_dim,
-            causal=True,  # This is newtokens run
+            causal=causal,
             sm_scale=sm_scale,
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
@@ -429,6 +430,10 @@ class FlashInferBackend(AttentionBackend):
         if capability is not None and capability.major == 10:
             return "HND"
         return None
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        return True
 
     forward_includes_kv_cache_update: bool = False
 
@@ -1061,7 +1066,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
                 page_size=self.page_size,
-                causal=True,
+                causal=common_attn_metadata.causal,
                 sm_scale=self.sm_scale,
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
@@ -1142,6 +1147,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        causal=common_attn_metadata.causal,
                     )
                 else:
                     assert isinstance(
@@ -1157,7 +1163,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=True,
+                        causal=common_attn_metadata.causal,
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
@@ -1480,8 +1486,6 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._new_tokens._sm_scale == self.scale
-                    assert prefill_wrapper._new_tokens._causal
-
                     prefill_wrapper.run(
                         layer,
                         prefill_query,
@@ -1499,7 +1503,6 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
